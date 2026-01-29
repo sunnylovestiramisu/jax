@@ -827,6 +827,144 @@ PyType_Slot PyClient::slots_[] = {
     {0, nullptr},
 };
 
+#include "xla/python/pjrt_ifrt/pjrt_array.h"
+#include "xla/shape.pb.h"
+#include "xla/pjrt/pjrt_c_api_client.h"
+
+absl::StatusOr<nanobind::bytes> PyClient::GetIpcHandle(
+    const PyArray& buffer) const {
+  ifrt::Array* ifrt_array = buffer.ifrt_array();
+  if (ifrt_array == nullptr) {
+    return absl::InvalidArgumentError(
+        "Cannot get IPC handle of a deleted buffer.");
+  }
+  auto* arr = llvm::dyn_cast_or_null<ifrt::PjRtCompatibleArray>(ifrt_array);
+  if (arr == nullptr) {
+    return absl::InvalidArgumentError(
+        "IPC is only supported on PjRt-compatible backends.");
+  }
+  if (arr->pjrt_buffers().size() != 1) {
+    return absl::InvalidArgumentError(
+        "IPC is only supported for single-device buffers.");
+  }
+  xla::PjRtBuffer* pjrt_buffer = arr->pjrt_buffers().front().get();
+
+  if (pjrt_buffer->IsTuple()) {
+    return absl::UnimplementedError("IPC is not supported for tuple buffers.");
+  }
+
+  TF_ASSIGN_OR_RETURN(auto external_ref,
+                      pjrt_buffer->AcquireExternalReference());
+
+  std::string handle;
+  // 1. Serialize pointer
+  std::uintptr_t ptr = reinterpret_cast<std::uintptr_t>(
+      external_ref->OpaqueDeviceMemoryDataPointer());
+  handle.append(reinterpret_cast<const char*>(&ptr), sizeof(ptr));
+
+  // 2. Serialize shape proto
+  std::string shape_str = pjrt_buffer->on_device_shape().ToProto().SerializeAsString();
+  uint32_t shape_len = shape_str.length();
+  handle.append(reinterpret_cast<const char*>(&shape_len), sizeof(shape_len));
+  handle.append(shape_str);
+
+  // 3. Serialize memory space
+  std::string memory_space_name =
+      pjrt_buffer->memory_space()->memory_space_name();
+  uint32_t memory_space_len = memory_space_name.length();
+  handle.append(reinterpret_cast<const char*>(&memory_space_len),
+                sizeof(memory_space_len));
+  handle.append(memory_space_name);
+
+  auto* ref_ptr = external_ref.release();
+  nb::capsule cleanup(ref_ptr, [](void* p) noexcept {
+    delete static_cast<xla::PjRtBuffer::ExternalReference*>(p);
+  });
+
+  nb::bytes bytes(handle.data(), handle.size());
+  bytes.attr("external_reference") = cleanup;
+  return bytes;
+}
+
+absl::StatusOr<nb_class_ptr<PyArray>> PyClient::GetBufferFromIpcHandle(
+    nb_class_ptr<PyClient> client, nanobind::bytes ipc_handle) {
+  const char* data = ipc_handle.c_str();
+  size_t size = ipc_handle.size();
+  size_t offset = 0;
+
+  // 1. Deserialize pointer
+  if (offset + sizeof(std::uintptr_t) > size) {
+    return absl::InvalidArgumentError("Invalid IPC handle: pointer");
+  }
+  std::uintptr_t ptr;
+  memcpy(&ptr, data + offset, sizeof(ptr));
+  offset += sizeof(ptr);
+
+  // 2. Deserialize shape proto
+  if (offset + sizeof(uint32_t) > size) {
+    return absl::InvalidArgumentError("Invalid IPC handle: shape length");
+  }
+  uint32_t shape_len;
+  memcpy(&shape_len, data + offset, sizeof(shape_len));
+  offset += sizeof(shape_len);
+
+  if (offset + shape_len > size) {
+    return absl::InvalidArgumentError("Invalid IPC handle: shape data");
+  }
+  std::string shape_str(data + offset, shape_len);
+  offset += shape_len;
+
+  xla::ShapeProto shape_proto;
+  if (!shape_proto.ParseFromString(shape_str)) {
+    return absl::InvalidArgumentError("Failed to parse shape from IPC handle.");
+  }
+  xla::Shape shape(shape_proto);
+
+  // 3. Deserialize memory space
+  if (offset + sizeof(uint32_t) > size) {
+    return absl::InvalidArgumentError("Invalid IPC handle: memory space length");
+  }
+  uint32_t memory_space_len;
+  memcpy(&memory_space_len, data + offset, sizeof(memory_space_len));
+  offset += sizeof(memory_space_len);
+
+  if (offset + memory_space_len > size) {
+    return absl::InvalidArgumentError("Invalid IPC handle: memory space data");
+  }
+  std::string memory_space_name(data + offset, memory_space_len);
+  offset += memory_space_len;
+
+  void* device_ptr = reinterpret_cast<void*>(ptr);
+
+  auto pjrt_client = client->pjrt_client();
+  TF_ASSIGN_OR_RETURN(auto memory_spaces, pjrt_client->memory_spaces());
+  xla::PjRtMemorySpace* memory_space = nullptr;
+  for (auto* ms : memory_spaces) {
+    if (ms->memory_space_name() == memory_space_name) {
+      memory_space = ms;
+      break;
+    }
+  }
+  if (memory_space == nullptr) {
+    return absl::InvalidArgumentError("Memory space not found.");
+  }
+
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<xla::PjRtBuffer> buffer,
+                      pjrt_client->CreateViewOfDeviceBuffer(
+                          device_ptr, shape, memory_space, /*on_delete_callback=*/[] {}));
+
+  auto* ifrt_client =
+      llvm::dyn_cast_or_null<ifrt::PjRtCompatibleClient>(client->ifrt_client());
+  if (ifrt_client == nullptr) {
+    throw xla::XlaRuntimeError(
+        "This operation is implemented for a PjRt-compatible backend only.");
+  }
+  TF_ASSIGN_OR_RETURN(auto ifrt_array,
+                      ifrt_client->CreatePjRtArray(std::move(buffer)));
+
+  return PyArray::MakeFromSingleDeviceArray(std::move(client),
+                                            std::move(ifrt_array), false, true);
+}
 /* static */ void PyClient::Register(nb::module_& m) {
   nb::enum_<xla::PjRtClient::HostBufferSemantics>(m, "HostBufferSemantics")
       .value("IMMUTABLE_ONLY_DURING_CALL",
@@ -1042,6 +1180,9 @@ PyType_Slot PyClient::slots_[] = {
       // TODO(zhangqiaorjc): Experimental.
       .def("defragment",
            [](PyClient& self) { xla::ThrowIfError(self.Defragment()); })
+      .def("get_ipc_handle", &PyClient::GetIpcHandle, nb::arg("buffer"))
+      .def_static("get_buffer_from_ipc_handle", &PyClient::GetBufferFromIpcHandle,
+                  nb::arg("client"), nb::arg("ipc_handle"))
       .def("make_python_callback_from_host_send_and_recv",
            xla::ValueOrThrowWrapper(
                &PyClient::MakePythonCallbackUsingHostSendAndRecv),

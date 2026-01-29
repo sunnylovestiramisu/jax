@@ -183,6 +183,11 @@ class PyClient {
       xla::ifrt::DeviceListRef executable_devices, xla::CompileOptions options,
       std::vector<nanobind::callable> host_callbacks);
 
+  absl::StatusOr<nanobind::bytes> GetIpcHandle(const PyArray& buffer) const;
+
+  static absl::StatusOr<nb_class_ptr<PyArray>> GetBufferFromIpcHandle(
+      nb_class_ptr<PyClient> client, nanobind::bytes ipc_handle);
+
   absl::StatusOr<nanobind::bytes> SerializeExecutable(
       const PyLoadedExecutable& executable) const;
   static absl::StatusOr<nb_class_ptr<PyLoadedExecutable>> DeserializeExecutable(

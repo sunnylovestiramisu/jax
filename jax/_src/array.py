@@ -494,6 +494,13 @@ class ArrayImpl(basearray.Array):
     aval_state = {'weak_type': self.aval.weak_type}
     return (_reconstruct_array, (fun, args, arr_state, aval_state))
 
+  def get_ipc_handle(self):
+    self._check_if_deleted()
+    if not dispatch.is_single_device_sharding(self.sharding):
+      raise ValueError("get_ipc_handle() is supported only for single-device "
+                       "arrays.")
+    return _get_device(self).client.get_ipc_handle(self)
+
   @use_cpp_method()
   def unsafe_buffer_pointer(self):
     if len(self._arrays) != 1:
@@ -1294,6 +1301,19 @@ def _array_global_result_handler(global_aval, out_sharding, committed):
       global_aval, out_sharding, committed=committed, _skip_checks=True
   )
 pxla.global_result_handlers[core.ShapedArray] = _array_global_result_handler
+
+
+def get_buffer_from_ipc_handle(ipc_handle):
+  """Returns a ``jax.Array`` from an IPC handle.
+
+  Args:
+    ipc_handle: The IPC handle from another process.
+
+  Returns:
+    A ``jax.Array`` that shares memory with the original array.
+  """
+  return xc.Client.get_buffer_from_ipc_handle(
+      xla_bridge.get_backend().client, ipc_handle)
 
 # Only used for Arrays that come out of pmap.
 def _array_local_result_handler(aval, sharding, indices):
